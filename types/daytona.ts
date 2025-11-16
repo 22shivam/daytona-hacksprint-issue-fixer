@@ -10,6 +10,13 @@ export interface DaytonaWorkspace {
   };
   ideUrl?: string;
   status?: string;
+  previewUrl?: string;
+  previewToken?: string;
+}
+
+export interface SandboxPair {
+  before: DaytonaWorkspace;
+  after: DaytonaWorkspace;
 }
 
 export interface CreateWorkspaceRequest {
@@ -29,7 +36,8 @@ export interface InMemoryIssue {
   repositoryOwner: string;
   title: string;
   body: string;
-  workspaceId?: string;
+  beforeWorkspaceId?: string;
+  afterWorkspaceId?: string;
   status: 'pending' | 'processing' | 'completed' | 'failed';
   createdAt: Date;
   updatedAt: Date;

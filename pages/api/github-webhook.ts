@@ -89,9 +89,10 @@ export default async function handler(
     };
     db.saveIssue(issueRecord);
 
-    // Initialize Daytona client
+    // Initialize clients
     const daytonaApiKey = process.env.DAYTONA_API_KEY;
     const daytonaApiUrl = process.env.DAYTONA_API_URL;
+    const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
     
     if (!daytonaApiKey) {
       console.error('DAYTONA_API_KEY is not set');
@@ -99,34 +100,127 @@ export default async function handler(
       return res.status(500).json({ error: 'Daytona API key not configured' });
     }
 
+    if (!anthropicApiKey) {
+      console.error('ANTHROPIC_API_KEY is not set');
+      db.updateIssue(parsedIssue.issueNumber, { status: 'failed' });
+      return res.status(500).json({ error: 'Anthropic API key not configured' });
+    }
+
     const daytonaClient = new DaytonaClient(daytonaApiKey, daytonaApiUrl);
 
     // Update issue status to processing
     db.updateIssue(parsedIssue.issueNumber, { status: 'processing' });
 
-    // Create Daytona sandbox
-    console.log(`Creating Daytona workspace for issue #${parsedIssue.issueNumber}...`);
-    const workspace = await daytonaClient.createWorkspace(
-      parsedIssue,
-      `issue-${parsedIssue.issueNumber}-${parsedIssue.repositoryName}`
+    // Step 1: Create BEFORE and AFTER sandboxes
+    console.log(`Creating BEFORE and AFTER sandboxes for issue #${parsedIssue.issueNumber}...`);
+    const sandboxPair = await daytonaClient.createSandboxPair(parsedIssue, anthropicApiKey);
+    
+    console.log(`BEFORE sandbox: ${sandboxPair.before.id}`);
+    console.log(`AFTER sandbox: ${sandboxPair.after.id}`);
+
+    // Step 2: Setup and run app in BEFORE sandbox
+    console.log('Setting up app in BEFORE sandbox...');
+    await daytonaClient.setupAndRunApp(sandboxPair.before.id, parsedIssue.repositoryName);
+
+    // Step 3: Run Claude Code CLI inside AFTER sandbox to analyze and implement fixes
+    console.log('Running Claude Code CLI inside AFTER sandbox...');
+    const claudeResult = await daytonaClient.runClaudeCodeInSandbox(
+      sandboxPair.after.id,
+      parsedIssue.repositoryName,
+      parsedIssue.title,
+      parsedIssue.body
     );
+    console.log('Claude Code CLI execution complete in AFTER sandbox');
+    console.log('Claude result:', claudeResult.result?.substring(0, 200) || 'No result');
 
-    console.log(`Workspace created: ${workspace.id} - ${workspace.name}`);
+    // Step 4: Setup and run app in AFTER sandbox
+    console.log('Setting up app in AFTER sandbox...');
+    await daytonaClient.setupAndRunApp(sandboxPair.after.id, parsedIssue.repositoryName);
 
-    // Update issue with workspace ID
+    // Step 5: Get preview URLs (refresh them to ensure they're current)
+    console.log('\n📋 Getting preview URLs for both sandboxes...');
+    const beforePreview = await daytonaClient.getPreviewUrl(sandboxPair.before.id, 3000);
+    const afterPreview = await daytonaClient.getPreviewUrl(sandboxPair.after.id, 3000);
+
+    // Update sandbox pair with preview URLs
+    sandboxPair.before.previewUrl = beforePreview.url;
+    sandboxPair.before.previewToken = beforePreview.token;
+    sandboxPair.after.previewUrl = afterPreview.url;
+    sandboxPair.after.previewToken = afterPreview.token;
+
+    // Step 6: Create branch, push changes, and create PR
+    const githubToken = process.env.GITHUB_TOKEN;
+    if (!githubToken) {
+      console.error('⚠️  GITHUB_TOKEN not set, skipping PR creation');
+    } else {
+      console.log('\n📝 Creating branch and pull request...');
+      try {
+        const prResult = await daytonaClient.createBranchAndPR(
+          sandboxPair.after.id,
+          parsedIssue.repositoryName,
+          parsedIssue.issueNumber,
+          parsedIssue.title,
+          parsedIssue.repositoryOwner,
+          parsedIssue.repositoryName,
+          parsedIssue.defaultBranch,
+          githubToken,
+          beforePreview.url,
+          afterPreview.url,
+          beforePreview.token,
+          afterPreview.token
+        );
+        console.log(`✅ PR created: ${prResult.prUrl}`);
+      } catch (error) {
+        console.error('❌ Failed to create PR:', error);
+        // Continue even if PR creation fails
+      }
+    }
+
+    // Print preview URLs in a clear, clickable format
+    console.log('\n' + '='.repeat(80));
+    console.log('🎉 ISSUE PROCESSING COMPLETE!');
+    console.log('='.repeat(80));
+    console.log(`\n📝 Issue #${parsedIssue.issueNumber}: ${parsedIssue.title}`);
+    console.log('\n' + '-'.repeat(80));
+    console.log('🔴 BEFORE SANDBOX (Original State)');
+    console.log('-'.repeat(80));
+    console.log(`   Sandbox ID: ${sandboxPair.before.id}`);
+    console.log(`   🔗 Preview URL: ${beforePreview.url}`);
+    console.log(`   🔑 Token: ${beforePreview.token}`);
+    console.log(`   📋 Access: curl -H "x-daytona-preview-token: ${beforePreview.token}" ${beforePreview.url}`);
+    console.log('\n' + '-'.repeat(80));
+    console.log('🟢 AFTER SANDBOX (With Fixes Applied)');
+    console.log('-'.repeat(80));
+    console.log(`   Sandbox ID: ${sandboxPair.after.id}`);
+    console.log(`   🔗 Preview URL: ${afterPreview.url}`);
+    console.log(`   🔑 Token: ${afterPreview.token}`);
+    console.log(`   📋 Access: curl -H "x-daytona-preview-token: ${afterPreview.token}" ${afterPreview.url}`);
+    console.log('\n' + '='.repeat(80) + '\n');
+
+    // Update issue with sandbox IDs
     db.updateIssue(parsedIssue.issueNumber, {
-      workspaceId: workspace.id,
+      beforeWorkspaceId: sandboxPair.before.id,
+      afterWorkspaceId: sandboxPair.after.id,
       status: 'completed',
     });
 
     // Return success response
     return res.status(200).json({
-      message: 'Issue processed and workspace created',
+      message: 'Issue processed successfully',
       issue: parsedIssue,
-      workspace: {
-        id: workspace.id,
-        name: workspace.name,
-        ideUrl: workspace.ideUrl,
+      sandboxes: {
+        before: {
+          id: sandboxPair.before.id,
+          name: sandboxPair.before.name,
+          previewUrl: sandboxPair.before.previewUrl,
+          previewToken: sandboxPair.before.previewToken,
+        },
+        after: {
+          id: sandboxPair.after.id,
+          name: sandboxPair.after.name,
+          previewUrl: sandboxPair.after.previewUrl,
+          previewToken: sandboxPair.after.previewToken,
+        },
       },
     });
   } catch (error) {

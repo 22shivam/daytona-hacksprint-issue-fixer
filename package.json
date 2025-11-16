@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "create-snapshot": "tsx scripts/create-snapshot.ts"
   },
   "dependencies": {
     "@daytonaio/sdk": "^0.115.0",
@@ -21,6 +22,7 @@
     "@types/react-dom": "^18.0.0",
     "eslint": "^8.0.0",
     "eslint-config-next": "^14.0.0",
+    "tsx": "^4.7.0",
     "typescript": "^5.0.0"
   }
 }
